@@ -2275,7 +2275,7 @@ function initBattleSync(){
 function submitBattleRoll(playerKey, value){
   if(!battleSync.active || !battleSync.cloud || !battleSync.roomId) return;
   if(typeof battleSync.cloud.submitBattleRoll !== 'function') return;
-  battleSync.cloud.submitBattleRoll(battleSync.roomId, playerKey, value, battleSync.rollRound).catch(()=>{});
+  battleSync.cloud.submitBattleRoll(battleSync.roomId, playerKey, value, battleSync.rollRound).catch((e)=>{ try{ appendLog(`[摇点同步失败] ${e?.message || e}`); }catch(err){} });
 }
 
 function requestBattleRollReset(){
@@ -2283,7 +2283,141 @@ function requestBattleRollReset(){
   if(typeof battleSync.cloud.resetBattleRoll !== 'function') return;
   const isHost = farPvpRuntimeGet(LOCAL_HOST_KEY) === 'true';
   if(!isHost) return;
-  battleSync.cloud.resetBattleRoll(battleSync.roomId, battleSync.rollRound).catch(()=>{});
+  battleSync.cloud.resetBattleRoll(battleSync.roomId, battleSync.rollRound).catch((e)=>{ try{ appendLog(`[重置摇点失败] ${e?.message || e}`); }catch(err){} });
+}
+
+
+// ---- Remote battle state serialization helpers ----
+// Firestore can only store plain data, but battle skill cards contain functions.
+// Remote PvP must therefore sync hands as skill names + safe metadata, then rebuild
+// the executable cards on the receiving client. Without this, both clients draw
+// different random hands and many remote skills appear to be wrong / missing.
+function farPvpSafeMeta(meta){
+  const out = {};
+  if(!meta || typeof meta !== 'object') return out;
+  for(const [k,v] of Object.entries(meta)){
+    if(v === null || ['string','number','boolean'].includes(typeof v)) out[k] = v;
+  }
+  return out;
+}
+function serializeSkillCard(sk){
+  if(!sk) return null;
+  return {
+    name: sk.name || '',
+    cost: typeof sk.cost === 'number' ? sk.cost : 0,
+    color: sk.color || '',
+    meta: farPvpSafeMeta(sk.meta || {}),
+  };
+}
+function serializeSkillPool(u){
+  try { return (u && Array.isArray(u.skillPool)) ? u.skillPool.map(serializeSkillCard).filter(Boolean) : []; }
+  catch(e){ return []; }
+}
+function makeRemoteExtraSkill(u, info){
+  const name = (typeof info === 'string') ? info : (info && info.name);
+  if(!u || !name) return null;
+  if(name === '黑瞬「释放」'){
+    const release = skill(
+      '黑瞬「释放」',
+      3,
+      'purple',
+      '释放所有墨片能量：敌方单位受到其最大 SP 的 50% + 30 SP 伤害',
+      (uu)=>[{r:uu.r,c:uu.c,dir:uu.facing}],
+      (uu)=> adoraBlackFlashRelease(uu),
+      {},
+      {castMs:1200, extraSkill:true}
+    );
+    release.meta = Object.assign({}, release.meta || {}, farPvpSafeMeta(info && info.meta));
+    release.meta.extraSkill = true;
+    return release;
+  }
+  if(name === '爆'){
+    const blast = skill(
+      '爆',
+      3,
+      'red',
+      '对所指方向2x3格造成50HP+10SP并叠1层爆裂（下一次友方攻击引爆：每层15HP，3x3范围）',
+      (uu,aimDir)=> aimDir ? forwardRectCentered(uu,aimDir,3,2) : (()=>{const a=[]; for(const d in DIRS) forwardRectCentered(uu,d,3,2).forEach(x=>a.push(x)); return a;})(),
+      (uu,desc)=> karmaBlast(uu, desc),
+      {aoe:true},
+      {castMs:900, extraSkill:true, karmaBlastExtra:true, grantedTurnsStarted:(u.turnsStarted||0)}
+    );
+    blast.meta = Object.assign({}, blast.meta || {}, farPvpSafeMeta(info && info.meta));
+    blast.meta.extraSkill = true;
+    blast.meta.karmaBlastExtra = true;
+    return blast;
+  }
+  return null;
+}
+function rebuildSkillCardByName(u, info){
+  const name = (typeof info === 'string') ? info : (info && info.name);
+  if(!u || !name) return null;
+  const extra = makeRemoteExtraSkill(u, info);
+  if(extra) return extra;
+  let factories = [];
+  try { factories = buildSkillFactoriesForUnit(u) || []; } catch(e) { factories = []; }
+  let factory = factories.find(f => f && (f.key === name));
+  if(!factory) {
+    factory = factories.find(f => {
+      try { const sk = f && f.make && f.make(); return sk && sk.name === name; }
+      catch(e){ return false; }
+    });
+  }
+  if(!factory || typeof factory.make !== 'function') return null;
+  try {
+    const sk = factory.make();
+    if(sk && info && info.meta){
+      sk.meta = Object.assign({}, sk.meta || {}, farPvpSafeMeta(info.meta));
+    }
+    return sk;
+  } catch(e) { return null; }
+}
+function restoreSkillPoolFromRemote(u, serializedPool){
+  if(!u) return;
+  const list = Array.isArray(serializedPool) ? serializedPool : [];
+  const rebuilt = [];
+  // Temporarily clear the hand so duplicate-prevention conditions do not block restore.
+  u.skillPool = [];
+  for(const item of list){
+    const sk = rebuildSkillCardByName(u, item);
+    if(sk) rebuilt.push(sk);
+  }
+  u.skillPool = rebuilt.slice(0, SKILLPOOL_MAX);
+}
+function serializeInkShards(){
+  try { return Array.from(inkShards.entries()).map(([key, side]) => ({ key, side })); }
+  catch(e){ return []; }
+}
+function restoreInkShards(serialized){
+  try {
+    inkShards.clear();
+    if(Array.isArray(serialized)){
+      for(const item of serialized){
+        if(item && item.key && (item.side === 'player' || item.side === 'enemy')) inkShards.set(item.key, item.side);
+      }
+    }
+  } catch(e) {}
+}
+function farPvpCopyKnownUnitRuntimeFields(u, data){
+  if(!u || !data) return;
+  const keys = [
+    '_lifeStealSmall','_participationRepeatProc','_tutorialSpImmuneUsed','_stanceType','_stanceTurns','_stanceReduction','_stanceReflect','_stanceSpPerTurn','_stanceHazDmgBuff','_stanceHealHaz','_fortressTurns','tutorialTurnCount','spPendingRestore','_usedThisTurn','_damageBoostStacks','_bloomActive','_lastSkillName'
+  ];
+  for(const k of keys){
+    if(Object.prototype.hasOwnProperty.call(data, k)) u[k] = data[k];
+  }
+}
+function farPvpCaptureKnownUnitRuntimeFields(u){
+  const out = {};
+  if(!u) return out;
+  const keys = [
+    '_lifeStealSmall','_participationRepeatProc','_tutorialSpImmuneUsed','_stanceType','_stanceTurns','_stanceReduction','_stanceReflect','_stanceSpPerTurn','_stanceHazDmgBuff','_stanceHealHaz','_fortressTurns','tutorialTurnCount','spPendingRestore','_usedThisTurn','_damageBoostStacks','_bloomActive','_lastSkillName'
+  ];
+  for(const k of keys){
+    const v = u[k];
+    if(v !== undefined && v !== null && ['string','number','boolean'].includes(typeof v)) out[k] = v;
+  }
+  return out;
 }
 
 function captureBattleState(){
@@ -2313,6 +2447,8 @@ function captureBattleState(){
       dealtStart: u.dealtStart,
       size: u.size,
       team: u.team,
+      skillPool: serializeSkillPool(u),
+      runtime: farPvpCaptureKnownUnitRuntimeFields(u),
     };
   }
   return {
@@ -2325,6 +2461,7 @@ function captureBattleState(){
     bonusStepsNextTurn,
     hazMarkedTargetId,
     hazTeamCollapsed,
+    inkShards: serializeInkShards(),
     units: unitsState,
   };
 }
@@ -2339,6 +2476,7 @@ function applyBattleStateInstant(state){
   bonusStepsNextTurn = state.bonusStepsNextTurn || bonusStepsNextTurn;
   hazMarkedTargetId = state.hazMarkedTargetId || null;
   hazTeamCollapsed = !!state.hazTeamCollapsed;
+  restoreInkShards(state.inkShards || []);
 
   Object.entries(state.units).forEach(([id, data]) => {
     const u = units[id];
@@ -2363,6 +2501,15 @@ function applyBattleStateInstant(state){
     u.actionsThisTurn = data.actionsThisTurn || 0;
     u.turnsStarted = data.turnsStarted || 0;
     u.dealtStart = !!data.dealtStart;
+    if(data.runtime) farPvpCopyKnownUnitRuntimeFields(u, data.runtime);
+  });
+
+  // Restore hands only after all unit flags/statuses are back, because some
+  // factories depend on level/oppression/turn counters and selected-skill state.
+  Object.entries(state.units).forEach(([id, data]) => {
+    const u = units[id];
+    if(!u || !data) return;
+    restoreSkillPoolFromRemote(u, data.skillPool || []);
   });
 
   renderAll();
@@ -2529,7 +2676,9 @@ function submitBattleState(){
   battleSync.stateVersion = payload.version;
   // Prevent echo-apply of our own state coming back from the room snapshot.
   battleSync.lastAppliedStateVersion = Math.max(battleSync.lastAppliedStateVersion || 0, payload.version);
-  battleSync.cloud.submitBattleState(battleSync.roomId, payload).catch(()=>{});
+  battleSync.cloud.submitBattleState(battleSync.roomId, payload).catch((e)=>{
+    try { appendLog(`[联机同步失败] ${e?.message || e}`); } catch(err) {}
+  });
 }
 
 function resetRollState(){

@@ -5939,10 +5939,16 @@ function checkEndOfTurn(){
     applyLevelSuppression();
     applyParalysisAtTurnStart('enemy');
     processUnitsTurnStart('enemy');
-    if(ENEMY_IS_AI_CONTROLLED){
+    renderAll();
+    // 关键修复：玩家1回合耗尽后，必须把“轮到玩家2/敌方 + 新步数”的状态同步出去。
+    // 旧版在使用技能/移动后先同步了 playerSteps=0，但没有再同步 currentSide='enemy' 和 enemySteps，
+    // 所以远程端有时会看到轮到自己却没有步数，或者仍停在上一方0步状态。
+    if(typeof submitBattleState === 'function') submitBattleState();
+    if(enemySteps<=0){
+      appendLog('回合开始减步/恐惧使敌方本回合没有可用步数，自动跳过');
+      setTimeout(()=>{ checkEndOfTurn(); }, 260);
+    } else if(ENEMY_IS_AI_CONTROLLED){
       setTimeout(()=>{ enemyTurn(); }, 200);
-    } else {
-      renderAll();
     }
     return;
   }

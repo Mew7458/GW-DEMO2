@@ -227,7 +227,7 @@ function createUnit(id, name, side, level, r, c, maxHp, maxSp, restoreOnZeroPct,
     chainShieldTurns: 0,
     chainShieldRetaliate: 0,
     tuskRageStacks: 0,
-    stunThreshold: extra.stunThreshold || 1,
+    stunThreshold: extra.stunThreshold || ((side === 'player' && /^(adora|dario|karma)$/.test(String(id).replace(/_p2$/,''))) ? 2 : 1),
     _staggerStacks: 0,
     pullImmune: !!extra.pullImmune,
     _spBroken: false,
@@ -300,7 +300,7 @@ function spawnInkShards(side, count=3){
   return created;
 }
 function consumeInkShardsUnderUnits(){
-  if(inkShards.size === 0) return;
+  if(inkShards.size === 0) return false;
   const beforeCounts = {
     player: countInkShards('player'),
     enemy: countInkShards('enemy'),
@@ -317,12 +317,13 @@ function consumeInkShardsUnderUnits(){
       removed = true;
     }
   }
-  if(!removed) return;
+  if(!removed) return false;
   for(const side of ['player','enemy']){
     if(beforeCounts[side] > 0 && countInkShards(side) === 0){
       grantBlackFlashRelease(side);
     }
   }
+  return true;
 }
 function grantBlackFlashRelease(side){
   const adoraId = side === 'player' ? 'adora' : 'adora_p2';
@@ -1810,19 +1811,32 @@ function ensureBleed(u){
   updateStatusStacks(u,'bleed',layers,{label:'流血', type:'debuff'});
   return layers;
 }
-function addBleed(u, layers=1, strengthPerLayer=0){
-  // 兼容旧调用：addBleed(target, 1, 1) 现在只代表“+1层流血”。
-  // 不会因为第三参数为1就额外+1强度；只有 strengthPerLayer > 1 时才视为明确加强度。
+function addBleed(u, layers=0, strengthPerLayer=0){
+  // 叠层/强度分离规则：
+  // - 明确加层数时只加层数；若目标原本没有强度，则强度自动建立为1。
+  // - 明确加强度时只加强度；若目标原本没有层数，则层数自动建立为1。
+  // - 不会因为同时有“默认值”而额外多加1强度/1层。
   if(!u || !u.status) return u && u.status ? (u.status.bleed||0) : 0;
   const addLayers = Math.max(0, Math.floor(Number(layers)||0));
   const explicitStrength = Math.max(0, Math.floor(Number(strengthPerLayer)||0));
   normalizeBleedState(u);
   let nextLayers = Math.max(0, Math.floor(Number(u.status.bleed)||0));
   let nextStrength = Math.max(0, Math.floor(Number(u.status.bleedStrength)||0));
+  const hadLayers = nextLayers > 0;
+  const hadStrength = nextStrength > 0;
+
   if(addLayers > 0) nextLayers += addLayers;
-  else if(nextLayers <= 0) nextLayers = 1;
-  if(nextStrength <= 0) nextStrength = 1;
-  if(explicitStrength > 1) nextStrength += explicitStrength;
+  if(explicitStrength > 1){
+    if(nextLayers <= 0) nextLayers = 1;
+    nextStrength = hadStrength ? (nextStrength + explicitStrength) : explicitStrength;
+  } else if(nextLayers > 0 && nextStrength <= 0){
+    nextStrength = 1;
+  }
+  if(addLayers <= 0 && explicitStrength <= 1 && nextLayers <= 0){
+    nextLayers = 1;
+    nextStrength = Math.max(1, nextStrength);
+  }
+  if(nextLayers > 0 && nextStrength <= 0) nextStrength = 1;
   u.status.bleedStrength = nextStrength;
   u.status.bleedStrengthQueue = Array.from({length: nextLayers}, ()=>nextStrength);
   updateStatusStacks(u,'bleed',nextLayers,{label:'流血', type:'debuff'});
@@ -1831,12 +1845,13 @@ function addBleed(u, layers=1, strengthPerLayer=0){
 function addBleedStrength(u, amount=1){
   if(!u || !u.status) return u && u.status ? (u.status.bleedStrength||0) : 0;
   const add = Math.max(0, Math.floor(Number(amount)||0));
+  if(add<=0) return u.status.bleedStrength||0;
   normalizeBleedState(u);
   let layers = Math.max(0, Math.floor(Number(u.status.bleed)||0));
   let strength = Math.max(0, Math.floor(Number(u.status.bleedStrength)||0));
+  const hadStrength = strength > 0;
   if(layers <= 0) layers = 1;
-  if(strength <= 0) strength = 1;
-  strength += add;
+  strength = hadStrength ? (strength + add) : add;
   u.status.bleedStrength = strength;
   u.status.bleedStrengthQueue = Array.from({length: layers}, ()=>strength);
   updateStatusStacks(u,'bleed',layers,{label:'流血', type:'debuff'});
@@ -2712,7 +2727,13 @@ function adoraPanicMove(u, payload){
   for(const d of Object.keys(DIRS)){
     const cell = forwardCellAt(u,d,1); if(!cell) continue;
     const t = getUnitAt(cell.r,cell.c);
-    if(t && t.side!==u.side && t.hp>0 && t.hp <= t.maxHp/2){ appendLog(`${u.name} 追击残血！`); adoraDagger(u,t); break; }
+    if(t && t.side!==u.side && t.hp>0 && t.hp <= t.maxHp/2){
+      appendLog(`${u.name} 追击残血！`);
+      const dmg = calcOutgoingDamage(u,10,t,'短匕轻挥');
+      damageUnit(t.id, dmg, 5, `${u.name} 追击 短匕轻挥 攻击 ${t.name}`, u.id,{skillFx:'adora:短匕轻挥'});
+      u.dmgDone += dmg;
+      break;
+    }
   }
   unitActed(u);
 }
@@ -2740,6 +2761,10 @@ function darioClaw(u,target){
   const dmg = calcOutgoingDamage(u,15,target,'机械爪击');
   cameraFocusOnCell(target.r, target.c);
   damageUnit(target.id, dmg, 0, `${u.name} 发动 机械爪击 ${target.name}`, u.id,{skillFx:'dario:机械爪击'});
+  if(target.hp>0 && Math.random()<0.15){
+    applyStunOrStack(target, 1, {reason:'机械爪击'});
+    appendLog(`${target.name} 被机械爪击打出眩晕层数`);
+  }
   u.dmgDone += dmg; unitActed(u);
 }
 function darioSwiftMove(u, payload){
@@ -2795,8 +2820,8 @@ function darioSweetAfterBitter(u){
   showSkillFx('dario:先苦后甜',{target:u});
   unitActed(u);
 }
-function darioTearWound(u, target){
-  if(!target || target.side===u.side){ appendLog('撕裂伤口 目标无效'); return; }
+async function darioTearWound(u, target){
+  if(!target || target.side===u.side){ appendLog('撕裂伤口 目标无效'); unitActed(u); return; }
 
   const isFullHp = target.hp >= target.maxHp;
   let dmg = 15;
@@ -2808,6 +2833,7 @@ function darioTearWound(u, target){
 
   const finalDmg = calcOutgoingDamage(u, dmg, target, '撕裂伤口');
   cameraFocusOnCell(target.r, target.c);
+  await telegraphThenImpact([{r:target.r,c:target.c}]);
 
   damageUnit(target.id, finalDmg, 0, `${u.name} 用 撕裂伤口 爪击 ${target.name}`, u.id, {skillFx:'dario:撕裂伤口'});
   u.dmgDone += finalDmg;
@@ -2816,13 +2842,13 @@ function darioTearWound(u, target){
   addBleed(target, bleedStacks, 1);
   appendLog(`${target.name} 附加 流血+${bleedStacks}`);
 
-  setTimeout(() => {
-    if(target.hp > 0){
-      const dmg2 = calcOutgoingDamage(u, 5, target, '撕裂伤口');
-      damageUnit(target.id, dmg2, 0, `${u.name} 抽出利爪`, u.id, {skillFx:'dario:撕裂伤口'});
-      u.dmgDone += dmg2;
-    }
-  }, 400);
+  await sleep(260);
+  if(target.hp > 0){
+    const dmg2 = calcOutgoingDamage(u, 5, target, '撕裂伤口');
+    damageUnit(target.id, dmg2, 0, `${u.name} 抽出利爪`, u.id, {skillFx:'dario:撕裂伤口'});
+    u.dmgDone += dmg2;
+  }
+  unitActed(u);
 }
 function darioStatusRecovery(u, aim){
   const t = getUnitAt(aim.r, aim.c);
@@ -3057,6 +3083,9 @@ function karmaGrip(u,target){
 }
 function unitActed(u){
   if(!u) return;
+  // 任何移动/瞬移/冲撞/拉扯后，只要单位站在己方墨片上就立刻拾取，
+  // 不再等下一次整屏刷新，避免黑瞬看起来“踩了但没拿到”。
+  try { consumeInkShardsUnderUnits(); } catch(e) {}
   u.actionsThisTurn = Math.max(0, (u.actionsThisTurn||0)+1);
 
   let statusNeedsRefresh = false;
@@ -3107,8 +3136,8 @@ function unitActed(u){
     renderStatus();
   }
 }
-function karmaPunch(u,target){
-  if(!target || target.side===u.side){ appendLog('沙包大的拳头 目标无效'); return; }
+async function karmaPunch(u,target){
+  if(!target || target.side===u.side){ appendLog('沙包大的拳头 目标无效'); unitActed(u); return; }
   const dmg = calcOutgoingDamage(u, 15, target, '沙包大的拳头');
   cameraFocusOnCell(target.r, target.c);
   damageUnit(target.id, dmg, 0, `${u.name} 出拳 ${target.name}`, u.id,{skillFx:'karma:沙包大的拳头'});
@@ -3118,21 +3147,18 @@ function karmaPunch(u,target){
   const adrenalineSkill = (u.skillPool || []).find(s => s && s.name === '肾上腺素' && !s._used);
   if(adrenalineSkill && u.consecAttacks >= 2 && u.consecAttacks % 2 === 0){
     appendLog(`${u.name} 的"肾上腺素"被动触发：连续攻击2次后自动再次攻击！`);
-    setTimeout(() => {
-      if(target.hp > 0){
-        const dmg1 = calcOutgoingDamage(u, 15, target, '沙包大的拳头');
-        damageUnit(target.id, dmg1, 0, `${u.name} 肾上腺素连击1`, u.id,{skillFx:'karma:沙包大的拳头'});
-        u.dmgDone += dmg1;
-
-        setTimeout(() => {
-          if(target.hp > 0){
-            const dmg2 = calcOutgoingDamage(u, 15, target, '沙包大的拳头');
-            damageUnit(target.id, dmg2, 0, `${u.name} 肾上腺素连击2`, u.id,{skillFx:'karma:沙包大的拳头'});
-            u.dmgDone += dmg2;
-          }
-        }, 400);
-      }
-    }, 400);
+    await sleep(260);
+    if(target.hp > 0){
+      const dmg1 = calcOutgoingDamage(u, 15, target, '沙包大的拳头');
+      damageUnit(target.id, dmg1, 0, `${u.name} 肾上腺素连击1`, u.id,{skillFx:'karma:沙包大的拳头'});
+      u.dmgDone += dmg1;
+    }
+    await sleep(260);
+    if(target.hp > 0){
+      const dmg2 = calcOutgoingDamage(u, 15, target, '沙包大的拳头');
+      damageUnit(target.id, dmg2, 0, `${u.name} 肾上腺素连击2`, u.id,{skillFx:'karma:沙包大的拳头'});
+      u.dmgDone += dmg2;
+    }
   }
 
   unitActed(u);
@@ -3154,7 +3180,7 @@ async function katz_RepeatedWhip(u, desc){
     const hitSet1=new Set(); let hits1=0;
     for(const c of cells){
       const tu=getUnitAt(c.r,c.c);
-      if(tu && tu.side!=='enemy' && !hitSet1.has(tu.id)){
+      if(tu && tu.side!==u.side && !hitSet1.has(tu.id)){
         damageUnit(tu.id, 10, 0, `${u.name} 反复鞭尸·第${cycle}次 第一鞭 命中 ${tu.name}`, u.id,{skillFx:'katz:反复鞭尸'});
         hitSet1.add(tu.id); hits1++;
       }
@@ -3163,7 +3189,7 @@ async function katz_RepeatedWhip(u, desc){
     const hitSet2=new Set(); let hits2=0;
     for(const c of cells){
       const tu=getUnitAt(c.r,c.c);
-      if(tu && tu.side!=='enemy' && !hitSet2.has(tu.id)){
+      if(tu && tu.side!==u.side && !hitSet2.has(tu.id)){
         damageUnit(tu.id, 15, 0, `${u.name} 反复鞭尸·第${cycle}次 第二鞭 重击 ${tu.name}`, u.id,{skillFx:'katz:反复鞭尸'});
         hitSet2.add(tu.id); hits2++;
       }
@@ -3186,7 +3212,7 @@ async function katz_EndSalvo(u, desc){
   let hits=0,set=new Set();
   for(const c of cells){
     const tu=getUnitAt(c.r,c.c);
-    if(tu && tu.side!=='enemy' && !set.has(tu.id)){
+    if(tu && tu.side!==u.side && !set.has(tu.id)){
       damageUnit(tu.id, 35, 0, `${u.name} 终焉礼炮 命中 ${tu.name}`, u.id, {ignoreCover:true, skillFx:'katz:终焉礼炮'});
       set.add(tu.id); hits++;
     }
@@ -3323,7 +3349,7 @@ async function haz_DeepHunt(u, desc){
   const cells = range_forward_n(u,3,dir);
   await telegraphThenImpact(cells);
   let target=null;
-  for(const c of cells){ const tu=getUnitAt(c.r,c.c); if(tu && tu.side!=='enemy'){ target=tu; break; } }
+  for(const c of cells){ const tu=getUnitAt(c.r,c.c); if(tu && tu.side!==u.side){ target=tu; break; } }
   if(!target){ appendLog('深海猎杀 未找到目标'); return; }
   const dmg = calcOutgoingDamage(u,25,target,'深海猎杀');
   cameraFocusOnCell(target.r, target.c);
@@ -3373,7 +3399,7 @@ async function haz_WhaleFall(u){
   const set=new Set(); let hits=0;
   for(const c of cells){
     const tu = getUnitAt(c.r,c.c);
-    if(tu && tu.side!=='enemy' && !set.has(tu.id)){
+    if(tu && tu.side!==u.side && !set.has(tu.id)){
       damageUnit(tu.id, 50, 20, `${u.name} 鲸落 轰击 ${tu.name}`, u.id, {ignoreCover:true, skillFx:'haz:鲸落'});
       addStatusStacks(tu,'paralyzed',1,{label:'恐惧', type:'debuff'});
       set.add(tu.id); hits++;
@@ -3389,14 +3415,14 @@ async function haz_PayThePrice(u, desc){
   const L1 = range_forward_n(u,3,dir);
   await telegraphThenImpact(L1);
   let h1=0;
-  for(const c of L1){ const tu=getUnitAt(c.r,c.c); showTrail(u.r,u.c,c.r,c.c); if(tu && tu.side!=='enemy'){ damageUnit(tu.id,15,0,`${u.name} 付出代价·前刺 命中 ${tu.name}`, u.id,{skillFx:'haz:付出代价'}); h1++; } }
+  for(const c of L1){ const tu=getUnitAt(c.r,c.c); showTrail(u.r,u.c,c.r,c.c); if(tu && tu.side!==u.side){ damageUnit(tu.id,15,0,`${u.name} 付出代价·前刺 命中 ${tu.name}`, u.id,{skillFx:'haz:付出代价'}); h1++; } }
   await stageMark(L1);
 
   // 段2：穿刺（前4）
   const L2 = range_forward_n(u,4,dir);
   await telegraphThenImpact(L2);
   let h2=0;
-  for(const c of L2){ const tu=getUnitAt(c.r,c.c); showTrail(u.r,u.c,c.r,c.c); if(tu && tu.side!=='enemy'){ damageUnit(tu.id,15,5,`${u.name} 付出代价·穿刺 命中 ${tu.name}`, u.id,{skillFx:'haz:付出代价'}); h2++; } }
+  for(const c of L2){ const tu=getUnitAt(c.r,c.c); showTrail(u.r,u.c,c.r,c.c); if(tu && tu.side!==u.side){ damageUnit(tu.id,15,5,`${u.name} 付出代价·穿刺 命中 ${tu.name}`, u.id,{skillFx:'haz:付出代价'}); h2++; } }
   await stageMark(L2);
 
   // 段3：横斩（横3x前2）
@@ -3405,7 +3431,7 @@ async function haz_PayThePrice(u, desc){
   let h3=0; const seen=new Set();
   for(const c of R){
     const tu=getUnitAt(c.r,c.c);
-    if(tu && tu.side!=='enemy' && !seen.has(tu.id)){
+    if(tu && tu.side!==u.side && !seen.has(tu.id)){
       damageUnit(tu.id,15,0,`${u.name} 付出代价·横斩 命中 ${tu.name}`, u.id,{skillFx:'haz:付出代价'});
       updateStatusStacks(tu,'hazBleedTurns',2,{label:'Haz流血', type:'debuff'});
       appendLog(`${tu.name} 附加 Haz流血(2)`); seen.add(tu.id); h3++;
@@ -3423,7 +3449,7 @@ async function haz_ForkOfHatred(u, desc){
   let h1=0; const seen1=new Set();
   for(const c of R){
     const tu=getUnitAt(c.r,c.c);
-    if(tu && tu.side!=='enemy' && !seen1.has(tu.id)){
+    if(tu && tu.side!==u.side && !seen1.has(tu.id)){
       damageUnit(tu.id,15,10,`${u.name} 仇恨之叉·横斩 命中 ${tu.name}`, u.id,{skillFx:'haz:仇恨之叉'});
       seen1.add(tu.id); h1++;
     }
@@ -3436,7 +3462,7 @@ async function haz_ForkOfHatred(u, desc){
   let h2=0; const seen2=new Set();
   for(const c of AOE){
     const tu=getUnitAt(c.r,c.c);
-    if(tu && tu.side!=='enemy' && !seen2.has(tu.id)){
+    if(tu && tu.side!==u.side && !seen2.has(tu.id)){
       damageUnit(tu.id,20,0,`${u.name} 仇恨之叉·重砸 命中 ${tu.name}`, u.id, {ignoreCover:true, skillFx:'haz:仇恨之叉'});
       updateStatusStacks(tu,'hazBleedTurns',2,{label:'Haz流血', type:'debuff'});
       appendLog(`${tu.name} 附加 Haz流血(2)`);
@@ -3464,7 +3490,7 @@ async function katz_ChainWhip(u,desc){
   let hits=0, set=new Set();
   for(const c of cells){
     const tu=getUnitAt(c.r,c.c);
-    if(tu && tu.side!=='enemy' && !set.has(tu.id)){
+    if(tu && tu.side!==u.side && !set.has(tu.id)){
       damageUnit(tu.id,25,0,`${u.name} 链式鞭击 命中 ${tu.name}`, u.id,{skillFx:'katz:链式鞭击'});
       addStatusStacks(tu,'paralyzed',1,{label:'恐惧', type:'debuff'});
       set.add(tu.id); hits++;
@@ -3483,7 +3509,7 @@ async function katz_MustErase(u, desc){
     let set=new Set(), hits=0;
     for(const c of cells){
       const tu=getUnitAt(c.r,c.c);
-      if(tu && tu.side!=='enemy' && !set.has(tu.id)){
+      if(tu && tu.side!==u.side && !set.has(tu.id)){
         damageUnit(tu.id, dmg, 0, `${u.name} 必须抹杀一切.. 第${cycle}段 命中 ${tu.name}`, u.id,{skillFx:'katz:必须抹杀一切。。'});
         set.add(tu.id); hits++;
       }
@@ -3517,7 +3543,7 @@ async function tusk_DeepRoar(u){
   const set=new Set(); let hits=0;
   for(const c of cells){
     const tu=getUnitAt(c.r,c.c);
-    if(tu && tu.side!=='enemy' && !set.has(tu.id)){
+    if(tu && tu.side!==u.side && !set.has(tu.id)){
       const reduced = applySpDamage(tu, 20, {sourceId:u.id});
       appendLog(`${tu.name} 因咆哮 SP -${reduced}`);
       showSkillFx('tusk:来自深海的咆哮',{target:tu});
@@ -3564,7 +3590,7 @@ async function tusk_BullCharge(u, desc){
   let hitTarget = null;
   for(const step of path){
     const occ = getUnitAt(step.r, step.c);
-    if(occ && occ.side!=='enemy'){ hitTarget = occ; break; }
+    if(occ && occ.side!==u.side){ hitTarget = occ; break; }
     if(!occ) lastFree = step;
     else break;
   }
@@ -3612,7 +3638,7 @@ async function neyla_PierceSnipe(u, desc){
   let hits=0, set=new Set();
   for(const c of line){
     const tu=getUnitAt(c.r,c.c);
-    if(tu && tu.side!=='enemy' && !set.has(tu.id)){
+    if(tu && tu.side!==u.side && !set.has(tu.id)){
       damageUnit(tu.id,30,0,`${u.name} 穿刺狙击 命中 ${tu.name}`, u.id,{skillFx:'neyla:穿刺狙击'});
       const bleedNext = Math.max(tu.status.bleed||0, 2);
       addBleed(tu, 1, 1);
@@ -3624,7 +3650,7 @@ async function neyla_PierceSnipe(u, desc){
 }
 async function neyla_EndShadow(u, aim){
   const tu = getUnitAt(aim.r, aim.c);
-  if(!tu || tu.side==='enemy') { appendLog('终末之影 未命中'); unitActed(u); return; }
+  if(!tu || tu.side===u.side) { appendLog('终末之影 未命中'); unitActed(u); return; }
   await telegraphThenImpact([{r:tu.r,c:tu.c}]);
   cameraFocusOnCell(tu.r, tu.c);
   damageUnit(tu.id, 50, 20, `${u.name} 终末之影 命中 ${tu.name}`, u.id,{skillFx:'neyla:终末之影'});
@@ -3636,7 +3662,7 @@ async function neyla_DoubleHook(u, desc){
   const cells = range_forward_n(u,3,dir);
   await telegraphThenImpact(cells);
   let target=null;
-  for(const c of cells){ const tu=getUnitAt(c.r,c.c); if(tu && tu.side!=='enemy'){ target=tu; break; } }
+  for(const c of cells){ const tu=getUnitAt(c.r,c.c); if(tu && tu.side!==u.side){ target=tu; break; } }
   if(!target){ appendLog('双钩牵制 未命中'); unitActed(u); return; }
   // 拉近一格
   const backDir = cardinalDirFromDelta(u.r - target.r, u.c - target.c);
@@ -3662,7 +3688,7 @@ async function neyla_ExecuteHarpoons(u, desc){
   const targets=[]; const seen=new Set();
   for(const cell of line){
     const tu = getUnitAt(cell.r, cell.c);
-    if(tu && tu.side!=='enemy' && !seen.has(tu.id)){
+    if(tu && tu.side!==u.side && !seen.has(tu.id)){
       targets.push(tu);
       seen.add(tu.id);
     }
@@ -3784,7 +3810,7 @@ async function kyn_DeathCall(u, target){
 // Kyn：割喉飞刃（4格内单体 20HP + 流血1 + 恐惧1）
 async function kyn_ThroatBlade(u, aim){
   const tu = getUnitAt(aim.r, aim.c);
-  if(!tu || tu.side==='enemy'){ appendLog('割喉飞刃 未命中'); unitActed(u); return; }
+  if(!tu || tu.side===u.side){ appendLog('割喉飞刃 未命中'); unitActed(u); return; }
   if(mdist(u,tu) > 4){ appendLog('割喉飞刃 超出射程（≤4）'); unitActed(u); return; }
   await telegraphThenImpact([{r:tu.r,c:tu.c}]);
   const dmg = calcOutgoingDamage(u,20,tu,'割喉飞刃');
@@ -3802,7 +3828,7 @@ async function kyn_ShadowDance_AOE(u){
   const seen=new Set(); let hits=0;
   for(const c of cells){
     const tu=getUnitAt(c.r,c.c);
-    if(tu && tu.side!=='enemy' && !seen.has(tu.id)){
+    if(tu && tu.side!==u.side && !seen.has(tu.id)){
       damageUnit(tu.id, 30, 0, `${u.name} 影杀之舞 横扫 ${tu.name}`, u.id, {ignoreCover:true, skillFx:'kyn:影杀之舞'});
       seen.add(tu.id); hits++;
     }
@@ -4056,12 +4082,13 @@ function buildSkillFactoriesForUnit(u){
       { key:'机械爪击', prob:0.80, cond:()=>true, make:()=> skill('机械爪击',1,'green','前方1-2格 15HP',
         (uu,aimDir)=> aimDir? range_forward_n(uu,2,aimDir) : (()=>{const a=[]; for(const d in DIRS) range_forward_n(uu,2,d).forEach(x=>a.push(x)); return a;})(),
         (uu,targetOrDesc)=> {
-          if(targetOrDesc && targetOrDesc.id) darioClaw(uu,targetOrDesc);
+          if(targetOrDesc && targetOrDesc.id) return darioClaw(uu,targetOrDesc);
           else if(targetOrDesc && targetOrDesc.dir){
             const line = range_forward_n(uu,2,targetOrDesc.dir);
             let tgt=null; for(const c of line){ const tu=getUnitAt(c.r,c.c); if(tu && tu.side!==uu.side){ tgt=tu; break; } }
-            if(tgt) darioClaw(uu,tgt); else appendLog('机械爪击 未命中');
+            if(tgt) return darioClaw(uu,tgt); else { appendLog('机械爪击 未命中'); unitActed(uu); return; }
           }
+          appendLog('机械爪击 未命中'); unitActed(uu);
         },
         {},
         {castMs:900}
@@ -4097,12 +4124,13 @@ function buildSkillFactoriesForUnit(u){
       { key:'撕裂伤口', prob:0.80, cond:()=>u.level>=50, make:()=> skill('撕裂伤口',1,'green','前3格爪击15HP叠1流血（非满血伤害+50%再叠1流血），抽出利爪5HP',
         (uu,aimDir)=> aimDir? range_forward_n(uu,3,aimDir) : (()=>{const a=[]; for(const d in DIRS) range_forward_n(uu,3,d).forEach(x=>a.push(x)); return a;})(),
         (uu,targetOrDesc)=> {
-          if(targetOrDesc && targetOrDesc.id) darioTearWound(uu,targetOrDesc);
+          if(targetOrDesc && targetOrDesc.id) return darioTearWound(uu,targetOrDesc);
           else if(targetOrDesc && targetOrDesc.dir){
             const line = range_forward_n(uu,3,targetOrDesc.dir);
             let tgt=null; for(const c of line){ const tu=getUnitAt(c.r,c.c); if(tu && tu.side!==uu.side){ tgt=tu; break; } }
-            if(tgt) darioTearWound(uu,tgt); else appendLog('撕裂伤口 未命中');
+            if(tgt) return darioTearWound(uu,tgt); else { appendLog('撕裂伤口 未命中'); unitActed(uu); return; }
           }
+          appendLog('撕裂伤口 未命中'); unitActed(uu);
         },
         {},
         {castMs:1100}
@@ -4194,7 +4222,8 @@ function buildSkillFactoriesForUnit(u){
             let tgt=null, dir=uu.facing;
             if(descOrTarget && descOrTarget.id) tgt=descOrTarget;
             else if(descOrTarget && descOrTarget.dir){ dir=descOrTarget.dir; const cell=forwardCellAt(uu,dir,1); if(cell) tgt=getUnitAt(cell.r,cell.c); }
-            if(tgt) haz_HarpoonStab(uu,tgt); else appendLog('鱼叉穿刺 未命中');
+            if(tgt && tgt.side!==uu.side) return haz_HarpoonStab(uu,tgt);
+            appendLog('鱼叉穿刺 未命中'); unitActed(uu);
           },
           {},
           {castMs:1100}
@@ -4207,7 +4236,7 @@ function buildSkillFactoriesForUnit(u){
         )},
         { key:'猎神之叉', prob:0.65, cond:()=>true, make:()=> skill('猎神之叉',2,'red','5x5内选择敌人：瞬移至其身旁并造成20(50%概率x2)+15SP并施加流血(2)',
           (uu)=> range_square_n(uu,2),
-          (uu,aim)=> { const tu = aim && aim.id ? aim : getUnitAt(aim.r, aim.c); if(tu && tu.side!=='enemy') haz_GodFork(uu,tu); else appendLog('猎神之叉 未命中'); },
+          (uu,aim)=> { const tu = aim && aim.id ? aim : getUnitAt(aim.r, aim.c); if(tu && tu.side!==uu.side) return haz_GodFork(uu,tu); appendLog('猎神之叉 未命中'); unitActed(uu); },
           {},
           {cellTargeting:true, castMs:1200}
         )},
@@ -4234,7 +4263,7 @@ function buildSkillFactoriesForUnit(u){
         )},
         { key:'怨念滋生', prob:0.33, cond:()=>true, make:()=> skill('怨念滋生',1,'green','全图：对被猎杀标记目标 施加1流血+1恐惧',
           (uu)=>[{r:uu.r,c:uu.c,dir:uu.facing}],
-        (uu)=> { if(!hazMarkedTargetId){ appendLog('怨念滋生：没有被标记的目标'); unitActed(uu); return; } const t=units[hazMarkedTargetId]; if(!t||t.hp<=0){ appendLog('怨念滋生：标记目标不存在或已倒下'); unitActed(uu); return; } addTempClassToCells([{r:t.r,c:t.c}],'highlight-tele',TELEGRAPH_MS); setTimeout(()=>{ addBleed(t, 1, 1); addStatusStacks(t,'paralyzed',1,{label:'恐惧', type:'debuff'}); showSkillFx('haz:怨念滋生',{target:t}); appendLog(`${uu.name} 怨念滋生：对 ${t.name} 施加 1层流血 与 1层恐惧`); }, TELEGRAPH_MS); unitActed(uu); },
+        async (uu)=> { if(!hazMarkedTargetId){ appendLog('怨念滋生：没有被标记的目标'); unitActed(uu); return; } const t=units[hazMarkedTargetId]; if(!t||t.hp<=0){ appendLog('怨念滋生：标记目标不存在或已倒下'); unitActed(uu); return; } addTempClassToCells([{r:t.r,c:t.c}],'highlight-tele',TELEGRAPH_MS); await sleep(TELEGRAPH_MS); addBleed(t, 1, 1); addStatusStacks(t,'paralyzed',1,{label:'恐惧', type:'debuff'}); showSkillFx('haz:怨念滋生',{target:t}); appendLog(`${uu.name} 怨念滋生：对 ${t.name} 施加 1层流血 与 1层恐惧`); unitActed(uu); },
           {},
           {castMs:800}
         )},
@@ -4257,7 +4286,7 @@ function buildSkillFactoriesForUnit(u){
       F.push(
         { key:'矛刺', prob:0.60, cond:()=>true, make:()=> skill('矛刺',1,'green','前方1格 20伤 自身+5SP',
           (uu,aimDir)=> aimDir? range_forward_n(uu,1,aimDir) : (()=>{const a=[]; for(const d in DIRS) range_forward_n(uu,1,d).forEach(x=>a.push(x)); return a;})(),
-          (uu,desc)=>{ let tgt=null, dir=uu.facing; if(desc && desc.dir){ dir=desc.dir; const c=forwardCellAt(uu,dir,1); if(c) tgt=getUnitAt(c.r,c.c); } if(tgt) katz_Thrust(uu,tgt); else appendLog('矛刺 未命中'); },
+          (uu,desc)=>{ let tgt=null, dir=uu.facing; if(desc && desc.dir){ dir=desc.dir; const c=forwardCellAt(uu,dir,1); if(c) tgt=getUnitAt(c.r,c.c); } if(tgt && tgt.side!==uu.side) return katz_Thrust(uu,tgt); appendLog('矛刺 未命中'); unitActed(uu); },
           {},
           {castMs:1000}
         )},
@@ -4373,13 +4402,13 @@ function buildSkillFactoriesForUnit(u){
       F.push(
         { key:'迅影突刺', prob:0.60, cond:()=>true, make:()=> skill('迅影突刺',1,'green','5x5内任一敌人身边 20HP（≤25%处决，处决后返身）',
           (uu)=> range_square_n(uu,2),
-          (uu,aim)=>{ const tu=getUnitAt(aim.r,aim.c); if(tu && tu.side!=='enemy') kyn_ShadowDash(uu,tu); },
+          (uu,aim)=>{ const tu=getUnitAt(aim.r,aim.c); if(tu && tu.side!==uu.side) return kyn_ShadowDash(uu,tu); appendLog('迅影突刺 目标无效'); unitActed(uu); },
           {aoe:false},
           {cellTargeting:true, castMs:1200}
         )},
         { key:'死亡宣告', prob:0.25, cond:()=>true, make:()=> skill('死亡宣告',3,'red','单体 50HP+30SP（≤30%处决，处决后返身）',
           (uu)=> inRadiusCells(uu,6,{allowOccupied:true}).map(p=>({...p,dir:uu.facing})),
-          (uu,aim)=>{ const tu=getUnitAt(aim.r,aim.c); if(tu && tu.side!=='enemy') kyn_DeathCall(uu,tu); },
+          (uu,aim)=>{ const tu=getUnitAt(aim.r,aim.c); if(tu && tu.side!==uu.side) return kyn_DeathCall(uu,tu); appendLog('死亡宣告 目标无效'); unitActed(uu); },
           {aoe:false},
           {cellTargeting:true, castMs:1200}
         )},
@@ -4400,7 +4429,7 @@ function buildSkillFactoriesForUnit(u){
       F.push(
         { key:'自我了断。。', prob:0.40, cond:()=>true, make:()=> skill('自我了断。。',2,'red','5x5内任意敌人：瞬杀，自己HP清零（压迫）',
           (uu)=> range_square_n(uu,2),
-          (uu,aim)=>{ const tu=getUnitAt(aim.r,aim.c); if(tu && tu.side!=='enemy'){ damageUnit(tu.id, tu.hp, 0, `${uu.name} 自我了断 秒杀 ${tu.name}`, uu.id,{skillFx:'kyn:自我了断。。'}); damageUnit(uu.id, uu.hp, 0, `${uu.name} 生命燃尽`, uu.id, {ignoreToughBody:true, skillFx:'kyn:自我了断。。', skillFxCtx:{target:uu}}); } unitActed(uu); },
+          (uu,aim)=>{ const tu=getUnitAt(aim.r,aim.c); if(tu && tu.side!==uu.side){ damageUnit(tu.id, tu.hp, 0, `${uu.name} 自我了断 秒杀 ${tu.name}`, uu.id,{skillFx:'kyn:自我了断。。'}); damageUnit(uu.id, uu.hp, 0, `${uu.name} 生命燃尽`, uu.id, {ignoreToughBody:true, skillFx:'kyn:自我了断。。', skillFxCtx:{target:uu}}); } unitActed(uu); },
           {aoe:false},
           {cellTargeting:true, castMs:1100}
         )}

@@ -207,7 +207,7 @@ function createUnit(id, name, side, level, r, c, maxHp, maxSp, restoreOnZeroPct,
     oppression: false,
     chainShieldTurns: 0,
     chainShieldRetaliate: 0,
-    stunThreshold: extra.stunThreshold || 1,
+    stunThreshold: extra.stunThreshold || ((side === 'player' && /^(adora|dario|karma)$/.test(String(id).replace(/_p2$/,''))) ? 2 : 1),
     _staggerStacks: 0,
     pullImmune: !!extra.pullImmune,
     spFloor: (typeof extra.spFloor === 'number') ? extra.spFloor : 0,
@@ -1672,19 +1672,32 @@ function ensureBleed(u){
   updateStatusStacks(u,'bleed',layers,{label:'流血', type:'debuff'});
   return layers;
 }
-function addBleed(u, layers=1, strengthPerLayer=0){
-  // 兼容旧调用：addBleed(target, 1, 1) 现在只代表“+1层流血”。
-  // 不会因为第三参数为1就额外+1强度；只有 strengthPerLayer > 1 时才视为明确加强度。
+function addBleed(u, layers=0, strengthPerLayer=0){
+  // 叠层/强度分离规则：
+  // - 明确加层数时只加层数；若目标原本没有强度，则强度自动建立为1。
+  // - 明确加强度时只加强度；若目标原本没有层数，则层数自动建立为1。
+  // - 不会因为同时有“默认值”而额外多加1强度/1层。
   if(!u || !u.status) return u && u.status ? (u.status.bleed||0) : 0;
   const addLayers = Math.max(0, Math.floor(Number(layers)||0));
   const explicitStrength = Math.max(0, Math.floor(Number(strengthPerLayer)||0));
   normalizeBleedState(u);
   let nextLayers = Math.max(0, Math.floor(Number(u.status.bleed)||0));
   let nextStrength = Math.max(0, Math.floor(Number(u.status.bleedStrength)||0));
+  const hadLayers = nextLayers > 0;
+  const hadStrength = nextStrength > 0;
+
   if(addLayers > 0) nextLayers += addLayers;
-  else if(nextLayers <= 0) nextLayers = 1;
-  if(nextStrength <= 0) nextStrength = 1;
-  if(explicitStrength > 1) nextStrength += explicitStrength;
+  if(explicitStrength > 1){
+    if(nextLayers <= 0) nextLayers = 1;
+    nextStrength = hadStrength ? (nextStrength + explicitStrength) : explicitStrength;
+  } else if(nextLayers > 0 && nextStrength <= 0){
+    nextStrength = 1;
+  }
+  if(addLayers <= 0 && explicitStrength <= 1 && nextLayers <= 0){
+    nextLayers = 1;
+    nextStrength = Math.max(1, nextStrength);
+  }
+  if(nextLayers > 0 && nextStrength <= 0) nextStrength = 1;
   u.status.bleedStrength = nextStrength;
   u.status.bleedStrengthQueue = Array.from({length: nextLayers}, ()=>nextStrength);
   updateStatusStacks(u,'bleed',nextLayers,{label:'流血', type:'debuff'});
@@ -1693,12 +1706,13 @@ function addBleed(u, layers=1, strengthPerLayer=0){
 function addBleedStrength(u, amount=1){
   if(!u || !u.status) return u && u.status ? (u.status.bleedStrength||0) : 0;
   const add = Math.max(0, Math.floor(Number(amount)||0));
+  if(add<=0) return u.status.bleedStrength||0;
   normalizeBleedState(u);
   let layers = Math.max(0, Math.floor(Number(u.status.bleed)||0));
   let strength = Math.max(0, Math.floor(Number(u.status.bleedStrength)||0));
+  const hadStrength = strength > 0;
   if(layers <= 0) layers = 1;
-  if(strength <= 0) strength = 1;
-  strength += add;
+  strength = hadStrength ? (strength + add) : add;
   u.status.bleedStrength = strength;
   u.status.bleedStrengthQueue = Array.from({length: layers}, ()=>strength);
   updateStatusStacks(u,'bleed',layers,{label:'流血', type:'debuff'});
@@ -5166,6 +5180,12 @@ function applyLevelSuppression(){
   else if(enemyAvg>playerAvg){ enemySteps += 2; appendLog(`敌方 +2 步（等级压制）`); }
   updateStepsUI();
 }
+function clearStance(u){
+  if(!u) return;
+  if(u._stanceType){ appendLog(`${u.name} 的${u._stanceType==='defense'?'防御姿态':'反伤姿态'} 结束`); }
+  u._stanceType=null; u._stanceTurns=0; u._stanceDmgRed=0; u._stanceSpPerTurn=0; u._reflectPct=0;
+}
+
 function processUnitsTurnStart(side){
   turnIndex += 1;
   if(side === 'enemy'){

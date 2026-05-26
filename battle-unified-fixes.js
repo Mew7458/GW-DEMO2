@@ -56,10 +56,19 @@
   function addBleedCompat(target, layers=1, strength=1){
     if(!target || !target.status) return;
     if(typeof addBleed === 'function') return addBleed(target,layers,strength);
-    const nextLayers = Math.max(0,(target.status.bleed||0)+layers);
-    let nextStrength = Math.max(0,(target.status.bleedStrength||0));
-    if(nextStrength <= 0) nextStrength = 1;
-    if(strength > 1) nextStrength += strength;
+    const addLayers = Math.max(0, Math.floor(Number(layers)||0));
+    const addStrength = Math.max(0, Math.floor(Number(strength)||0));
+    let nextLayers = Math.max(0, Math.floor(Number(target.status.bleed)||0));
+    let nextStrength = Math.max(0, Math.floor(Number(target.status.bleedStrength)||0));
+    const hadStrength = nextStrength > 0;
+    if(addLayers > 0) nextLayers += addLayers;
+    if(addStrength > 1){
+      if(nextLayers <= 0) nextLayers = 1;
+      nextStrength = hadStrength ? (nextStrength + addStrength) : addStrength;
+    } else if(nextLayers > 0 && nextStrength <= 0){
+      nextStrength = 1;
+    }
+    if(nextLayers <= 0){ nextLayers = 1; nextStrength = Math.max(1, nextStrength); }
     target.status.bleedStrength = nextStrength;
     if(typeof updateStatusStacks === 'function') updateStatusStacks(target,'bleed',nextLayers,{label:'流血', type:'debuff'});
     else target.status.bleed = nextLayers;

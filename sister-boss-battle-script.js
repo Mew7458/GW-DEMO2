@@ -213,7 +213,7 @@ function createUnit(id, name, side, level, r, c, maxHp, maxSp, restoreOnZeroPct,
     oppression: false,
     chainShieldTurns: 0,
     chainShieldRetaliate: 0,
-    stunThreshold: extra.stunThreshold || 1,
+    stunThreshold: extra.stunThreshold || ((side === 'player' && /^(adora|dario|karma)$/.test(String(id).replace(/_p2$/,''))) ? 2 : 1),
     _staggerStacks: 0,
     pullImmune: !!extra.pullImmune,
     spFloor: (typeof extra.spFloor === 'number') ? extra.spFloor : 0,
@@ -241,7 +241,7 @@ units['adora'] = createUnit('adora','Adora','player',35, 19, 15, 100,100, 0.5,0,
 units['dario'] = createUnit('dario','Dario','player',35, 18, 12, 150,100, 0.75,0, ['quickAdjust','counter','moraleBoost']);
 units['karma'] = createUnit('karma','Karma','player',35, 18, 18, 200,50, 0.5,20, ['violentAddiction','toughBody','pride']);
 
-// 西斯特 Boss（文档：占1格，Boss，初始等级45，HP550，SP125，护甲15）
+// 西斯特 Boss（文档7：占1格，Boss，初始等级45，HP550，SP125；1阶段护甲20，2阶段护甲15）
 units['sister'] = createUnit('sister','西斯特','enemy',45, 2, 15, 550, 125, 0, 0, [
   'sisterSharp','sisterWeb','sisterPalette','sisterAcrylic','sisterStepAhead','sisterNoRule','sisterInspiration','sisterAware'
 ], {
@@ -1773,19 +1773,32 @@ function ensureBleed(u){
   updateStatusStacks(u,'bleed',layers,{label:'流血', type:'debuff'});
   return layers;
 }
-function addBleed(u, layers=1, strengthPerLayer=0){
-  // 兼容旧调用：addBleed(target, 1, 1) 现在只代表“+1层流血”。
-  // 不会因为第三参数为1就额外+1强度；只有 strengthPerLayer > 1 时才视为明确加强度。
+function addBleed(u, layers=0, strengthPerLayer=0){
+  // 叠层/强度分离规则：
+  // - 明确加层数时只加层数；若目标原本没有强度，则强度自动建立为1。
+  // - 明确加强度时只加强度；若目标原本没有层数，则层数自动建立为1。
+  // - 不会因为同时有“默认值”而额外多加1强度/1层。
   if(!u || !u.status) return u && u.status ? (u.status.bleed||0) : 0;
   const addLayers = Math.max(0, Math.floor(Number(layers)||0));
   const explicitStrength = Math.max(0, Math.floor(Number(strengthPerLayer)||0));
   normalizeBleedState(u);
   let nextLayers = Math.max(0, Math.floor(Number(u.status.bleed)||0));
   let nextStrength = Math.max(0, Math.floor(Number(u.status.bleedStrength)||0));
+  const hadLayers = nextLayers > 0;
+  const hadStrength = nextStrength > 0;
+
   if(addLayers > 0) nextLayers += addLayers;
-  else if(nextLayers <= 0) nextLayers = 1;
-  if(nextStrength <= 0) nextStrength = 1;
-  if(explicitStrength > 1) nextStrength += explicitStrength;
+  if(explicitStrength > 1){
+    if(nextLayers <= 0) nextLayers = 1;
+    nextStrength = hadStrength ? (nextStrength + explicitStrength) : explicitStrength;
+  } else if(nextLayers > 0 && nextStrength <= 0){
+    nextStrength = 1;
+  }
+  if(addLayers <= 0 && explicitStrength <= 1 && nextLayers <= 0){
+    nextLayers = 1;
+    nextStrength = Math.max(1, nextStrength);
+  }
+  if(nextLayers > 0 && nextStrength <= 0) nextStrength = 1;
   u.status.bleedStrength = nextStrength;
   u.status.bleedStrengthQueue = Array.from({length: nextLayers}, ()=>nextStrength);
   updateStatusStacks(u,'bleed',nextLayers,{label:'流血', type:'debuff'});
@@ -1794,12 +1807,13 @@ function addBleed(u, layers=1, strengthPerLayer=0){
 function addBleedStrength(u, amount=1){
   if(!u || !u.status) return u && u.status ? (u.status.bleedStrength||0) : 0;
   const add = Math.max(0, Math.floor(Number(amount)||0));
+  if(add<=0) return u.status.bleedStrength||0;
   normalizeBleedState(u);
   let layers = Math.max(0, Math.floor(Number(u.status.bleed)||0));
   let strength = Math.max(0, Math.floor(Number(u.status.bleedStrength)||0));
+  const hadStrength = strength > 0;
   if(layers <= 0) layers = 1;
-  if(strength <= 0) strength = 1;
-  strength += add;
+  strength = hadStrength ? (strength + add) : add;
   u.status.bleedStrength = strength;
   u.status.bleedStrengthQueue = Array.from({length: layers}, ()=>strength);
   updateStatusStacks(u,'bleed',layers,{label:'流血', type:'debuff'});
@@ -1835,6 +1849,21 @@ const SISTER_PRIMARY_COLORS = ['red','blue','yellow'];
 const SISTER_SECONDARY_COLORS = ['purple','orange','green'];
 const sisterPaintMarks = new Set();
 
+function sisterCanReceiveColorState(u){
+  // 特殊颜色状态是西斯特的颜料诅咒，应该主要挂在敌方单位身上。
+  // 西斯特自己不能被这些颜色状态反过来削弱/反伤/黑色真伤。
+  return !!(u && u.id !== 'sister');
+}
+function clearSisterSelfColors(){
+  const s = units && units['sister'];
+  if(!s || !s.sisterColors) return;
+  for(const key of SISTER_COLOR_KEYS){
+    s.sisterColors[key].layers = 0;
+    s.sisterColors[key].strength = 0;
+  }
+  s._sisterMixMemory = {purple:0,orange:0,green:0,black:0};
+}
+
 function initSisterState(u){
   if(!u) return;
   ensureSisterColors(u);
@@ -1864,6 +1893,7 @@ function ensureSisterColors(u){
 function sisterColor(u, key){ const colors=ensureSisterColors(u); return colors ? colors[key] : {layers:0,strength:0}; }
 function sisterColorStrength(u, key){ const c=sisterColor(u,key); return c.layers>0 ? Math.max(1,c.strength||1) : 0; }
 function sisterTotalColorLayers(u, includeBlack=true){
+  if(!sisterCanReceiveColorState(u)) return 0;
   const colors=ensureSisterColors(u); if(!colors) return 0;
   return SISTER_COLOR_KEYS.reduce((sum,k)=> sum + (includeBlack || k!=='black' ? colors[k].layers : 0), 0);
 }
@@ -1887,20 +1917,37 @@ function sisterSpendPaint(u, layers=1){
 }
 function sisterAddColor(u, key, layers=1, strength=1, reason=''){
   if(!u || !u.status || !SISTER_COLOR_KEYS.includes(key)) return 0;
+  if(!sisterCanReceiveColorState(u)){
+    clearSisterSelfColors();
+    return 0;
+  }
   const colors=ensureSisterColors(u);
   const addLayers = Math.max(0, Math.floor(Number(layers)||0));
-  const addStrength = Math.max(1, Math.floor(Number(strength)||1));
-  if(addLayers<=0) return colors[key].layers;
-  colors[key].layers += addLayers;
-  colors[key].strength += addLayers * addStrength;
-  showStatusFloat(u,SISTER_COLOR_LABELS[key],{type:key==='black'?'debuff':'debuff',delta:addLayers,offsetY:-104});
-  appendLog(`${u.name} 获得 ${addLayers} 层${SISTER_COLOR_LABELS[key]}（强度+${addLayers*addStrength}${reason?`，${reason}`:''}）`);
+  const addStrength = Math.max(0, Math.floor(Number(strength)||0));
+  const hadLayers = (colors[key].layers||0) > 0;
+  const hadStrength = (colors[key].strength||0) > 0;
+  if(addLayers<=0 && addStrength<=0) return colors[key].layers;
+
+  if(addLayers>0){
+    colors[key].layers += addLayers;
+    // 只加层数时，若目标原本没有强度，则固定建立强度1；不会额外多加1强度。
+    if(addStrength>0) colors[key].strength += addLayers * addStrength;
+    else if(!hadStrength) colors[key].strength = 1;
+  } else if(addStrength>0){
+    // 只加强度时，若目标原本没有层数，则固定建立1层；不会额外多加1层。
+    if(!hadLayers) colors[key].layers = 1;
+    colors[key].strength += addStrength;
+  }
+  const layerDelta = addLayers>0 ? addLayers : (!hadLayers && addStrength>0 ? 1 : 0);
+  showStatusFloat(u,SISTER_COLOR_LABELS[key],{type:key==='black'?'debuff':'debuff',delta:layerDelta||null,offsetY:-104});
+  appendLog(`${u.name} 获得 ${layerDelta?`${layerDelta}层`:''}${SISTER_COLOR_LABELS[key]}${addStrength?`（强度+${addLayers>0?addLayers*addStrength:addStrength}${reason?`，${reason}`:''}）`:(reason?`（${reason}）`:'')}`);
   const sis = units && units['sister'];
-  if(key==='black' && sis){ sis._sisterCumulativeBlack = (sis._sisterCumulativeBlack||0) + addLayers + addLayers*addStrength; }
+  if(key==='black' && sis){ sis._sisterCumulativeBlack = (sis._sisterCumulativeBlack||0) + Math.max(0, layerDelta) + Math.max(0, addLayers>0?addLayers*addStrength:addStrength); }
   sisterApplyColorMixing(u);
   return colors[key].layers;
 }
 function sisterConsumeColor(u, key, layers=1){
+  if(!sisterCanReceiveColorState(u)){ clearSisterSelfColors(); return {layers:0,strength:0}; }
   const colors=ensureSisterColors(u); if(!colors || !colors[key]) return {layers:0,strength:0};
   const count = Math.min(Math.max(0, Math.floor(Number(layers)||0)), colors[key].layers);
   if(count<=0) return {layers:0,strength:0};
@@ -1912,7 +1959,7 @@ function sisterConsumeColor(u, key, layers=1){
   return {layers:count, strength:avg};
 }
 function sisterApplyColorMixing(u){
-  if(!u || u._sisterMixing) return;
+  if(!u || !sisterCanReceiveColorState(u) || u._sisterMixing) return;
   u._sisterMixing = true;
   try{
     const colors=ensureSisterColors(u);
@@ -2286,7 +2333,9 @@ function checkSisterPhase(){
   s.sp = Math.min(-1, s.sp - 126);
   appendLog('【意识到了】西斯特 HP≤200：关闭原技能池，切换新技能池；SP 永远保持 0 以下，所有特殊颜色状态转为黑色。');
   void playSisterBGMPhase(2, {restart:true, fadeMs:850});
+  clearSisterSelfColors();
   for(const u of Object.values(units)){
+    if(!sisterCanReceiveColorState(u)) continue;
     const colors=ensureSisterColors(u);
     let layers=0, strength=0;
     for(const key of ['red','blue','yellow','orange','green','purple']){
@@ -2324,13 +2373,16 @@ function checkSisterSpCrash(u){
 }
 function sisterProcessTurnStart(u, side){
   ensureSisterColors(u);
-  const blue = sisterColor(u,'blue');
+  if(!sisterCanReceiveColorState(u)){
+    clearSisterSelfColors();
+  }
+  const blue = sisterCanReceiveColorState(u) ? sisterColor(u,'blue') : {layers:0,strength:0};
   if(blue.layers>0){
     const spend=sisterConsumeColor(u,'blue',1);
     const spDmg = spend.strength * 3;
     if(spDmg>0) damageUnit(u.id, 0, spDmg, `${u.name} 的蓝色状态侵蚀SP`, null, {trueDamage:true, ignoreSisterColorRetaliation:true});
   }
-  const black = sisterColor(u,'black');
+  const black = sisterCanReceiveColorState(u) ? sisterColor(u,'black') : {layers:0,strength:0};
   if(black.layers>0){
     const spend=sisterConsumeColor(u,'black',1);
     const hpDmg = spend.strength * 5;
@@ -2391,7 +2443,7 @@ function sisterApplyOffensiveModifiers(source, target, hpDmg, spDmg, opts){
     const boost = sisterConsumeDamageBoostForAttack(source, opts || {});
     if(boost>0 && hp>0) hp = Math.round(hp * (1 + boost * 0.10));
   }
-  const yellow = sisterColor(source,'yellow');
+  const yellow = sisterCanReceiveColorState(source) ? sisterColor(source,'yellow') : {layers:0,strength:0};
   if(yellow.layers>0 && (hp>0 || sp>0)){
     const spend=sisterConsumeColor(source,'yellow',1);
     const cut = Math.min(0.95, spend.strength * 0.03);
@@ -2402,7 +2454,7 @@ function sisterApplyOffensiveModifiers(source, target, hpDmg, spDmg, opts){
   return {hpDmg:hp, spDmg:sp};
 }
 function sisterBlackConversion(target, hpDmg, trueDamage){
-  if(trueDamage || hpDmg<=0) return {hpDmg, extraTrueHp:0};
+  if(trueDamage || hpDmg<=0 || !sisterCanReceiveColorState(target)) return {hpDmg, extraTrueHp:0};
   const black=sisterColor(target,'black');
   if(black.layers<=0) return {hpDmg, extraTrueHp:0};
   const strength = Math.max(1, black.strength || black.layers);
@@ -2416,7 +2468,7 @@ function sisterAfterDamageResolved(target, source, finalHp, finalSp, opts={}){
   if(!target || target.hp<0) return;
   if(target.id==='sister') checkSisterPhase();
   if(!source || !target || source===target || source.side===target.side || opts.ignoreSisterColorRetaliation) return;
-  if(finalHp>0 || finalSp>0){
+  if(sisterCanReceiveColorState(target) && (finalHp>0 || finalSp>0)){
     const red=sisterColor(target,'red');
     if(red.layers>0){
       const spend=sisterConsumeColor(target,'red',1);
@@ -2444,7 +2496,7 @@ function sisterAfterDamageResolved(target, source, finalHp, finalSp, opts={}){
     if(Math.random()<0.10) sisterAddPaint(source,1,'丙烯10%');
     source._sisterHitCounter = (source._sisterHitCounter||0) + 1;
     if(source.status && source.status.inspiration>0 && source._sisterHitCounter % 5 === 0){
-      sisterAddColor(target, sisterRandomColor(), 1, 1, '灵感每5次伤害');
+      if(sisterCanReceiveColorState(target)) sisterAddColor(target, sisterRandomColor(), 1, 1, '灵感每5次伤害');
     }
   }
   if(target.id==='sister' && (finalHp>0 || finalSp>0) && source.side==='player'){
@@ -2455,7 +2507,7 @@ function sisterAfterDamageResolved(target, source, finalHp, finalSp, opts={}){
       if(dest) sisterTeleportUnit(target,dest,'先走一步～');
     }
   }
-  const orange=sisterColor(source,'orange');
+  const orange=sisterCanReceiveColorState(source) ? sisterColor(source,'orange') : {layers:0,strength:0};
   if(orange.layers>0 && finalHp>0){
     const spend=sisterConsumeColor(source,'orange',1);
     const reflectPct = 0.15 + spend.strength * 0.05;
@@ -3008,7 +3060,7 @@ function getBaseArmorForUnit(u){
     'Kyn': 20,
     '宰': 50,
     'Velmira': 60,
-    '西斯特': 15,
+    '西斯特': (u.id==='sister' && u._sisterAwakened) ? 15 : 20,
     'Lirathe': 50,
     '刑警队员': 0,
     '雏形赫雷西成员': 10,
@@ -4411,7 +4463,7 @@ async function sisterPublish(u){
   renderAll();
   await sleep(180);
 
-  // (3)(4) 左侧2x5 → 右侧2x5：不是同一区域斩两次。
+  // (3)(4) 左侧2x5 → 右侧2x5。文档7：左侧斩后+1增伤；右侧斩/中心坠落为0层增伤。
   const publishCuts = [
     {cells:left2x5,  cls:'highlight-publish-left',  caption:'左侧斩去', label:'左侧斩', token:'publish-left',  reverse:false},
     {cells:right2x5, cls:'highlight-publish-right', caption:'右侧斩回', label:'右侧斩', token:'publish-right', reverse:true}
@@ -4429,7 +4481,7 @@ async function sisterPublish(u){
           damageUnit(t.id,25,0,`${u.name} 发布·${cut.label} ${t.name}`,u.id,{skillFx:null,ignoreCover:true,sisterBoostToken:`${cut.token}-${i+1}`,noFx:true,noShake:true,noPulse:true});
         }
         rememberHit(targets);
-        sisterAddPermanentDamageBoost(u, 1, `发布：${cut.label}后`);
+        if(i===0) sisterAddPermanentDamageBoost(u, 1, `发布：${cut.label}后`);
         renderAll();
       }
     });
@@ -4445,7 +4497,7 @@ async function sisterPublish(u){
         damageUnit(t.id,20,0,`${u.name} 发布·中心坠落 ${t.name}`,u.id,{skillFx:null,ignoreCover:true,sisterBoostToken:'publish-center',noFx:true,noShake:true,noPulse:true});
       }
       rememberHit(centerTargets);
-      sisterAddPermanentDamageBoost(u, 1, '发布：中心坠落后');
+      // 文档7：中心坠落给0层增伤，不再额外增加。
       renderAll();
     }
   });
@@ -4491,7 +4543,7 @@ async function sisterPublish(u){
 function buildSisterSkillFactories(u){
   const publishReady = u._sisterAwakened && (u._sisterCumulativeBlack||0) >= 50;
   const signatureReady = sisterSignatureEligibleTargets().length > 0;
-  const publishFactory = { key:'发布', prob:1, cond:()=>publishReady, make:()=> skill('发布',999,'black','黑色累计（层数+强度）≥50后唯一可用：获得1颜料，拖入面前5x5，左侧2x5斩一次、右侧2x5斩一次，中心3x3坠落，整幅5x5砸落并引爆黑色，砸飞随机眩晕（消耗剩余全部步数）',
+  const publishFactory = { key:'发布', prob:1, cond:()=>publishReady, make:()=> skill('发布',999,'black','黑色累计（层数+强度）≥50后唯一可用：获得1颜料，拖入面前5x5，左侧2x5斩一次并+1增伤，右侧2x5斩一次，中心3x3坠落，整幅5x5砸落并引爆黑色，砸飞随机眩晕（消耗剩余全部步数）',
     (uu,aimDir)=> sisterForwardCanvasCells(uu, aimDir||uu.facing), (uu)=>sisterPublish(uu), {aoe:true}, {consumeAllSteps:true, castMs:3600}) };
   const signatureFactory = { key:'签名', prob:1, cond:()=>sisterSignatureEligibleTargets().length>0, make:()=> skill('签名',1,'black','目标拥有非黑全色时唯一可用；消耗剩余全部步数，签上名字并追加黑色/完成作品',
     (uu)=> sisterSignatureEligibleTargets().map(t=>({r:t.r,c:t.c,dir:cardinalDirFromDelta(t.r-uu.r,t.c-uu.c)})), (uu,aim)=>sisterSignature(uu,aim), {}, {cellTargeting:true, extraSkill:true, consumeAllSteps:true, castMs:1600}) };
@@ -5816,6 +5868,12 @@ function applyLevelSuppression(){
   else if(enemyAvg>playerAvg){ enemySteps += 2; appendLog(`敌方 +2 步（等级压制）`); }
   updateStepsUI();
 }
+function clearStance(u){
+  if(!u) return;
+  if(u._stanceType){ appendLog(`${u.name} 的${u._stanceType==='defense'?'防御姿态':'反伤姿态'} 结束`); }
+  u._stanceType=null; u._stanceTurns=0; u._stanceDmgRed=0; u._stanceSpPerTurn=0; u._reflectPct=0;
+}
+
 function processUnitsTurnStart(side){
   turnIndex += 1;
   for(const id in units){
